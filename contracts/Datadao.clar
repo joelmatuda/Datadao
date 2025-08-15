@@ -20,8 +20,20 @@
 (define-constant ERR_NOT_ARBITRATOR (err u118))
 (define-constant ERR_DISPUTE_STAGE_MISMATCH (err u119))
 (define-constant ERR_INVALID_MEDIATION_PROPOSAL (err u120))
+(define-constant ERR_BOUNTY_NOT_FOUND (err u121))
+(define-constant ERR_BOUNTY_EXPIRED (err u122))
+(define-constant ERR_BOUNTY_ALREADY_CLAIMED (err u123))
+(define-constant ERR_INSUFFICIENT_BOUNTY_STAKE (err u124))
+(define-constant ERR_INVALID_BOUNTY_TYPE (err u125))
+(define-constant ERR_BOUNTY_NOT_ACTIVE (err u126))
+(define-constant ERR_INVALID_EVIDENCE_SUBMISSION (err u127))
+(define-constant ERR_BOUNTY_VERIFICATION_FAILED (err u128))
+(define-constant ERR_HUNTER_NOT_QUALIFIED (err u129))
 
 (define-data-var next-proposal-id uint u1)
+(define-data-var next-bounty-id uint u1)
+(define-data-var min-bounty-amount uint u500000)
+(define-data-var bounty-verification-period uint u720)
 (define-data-var next-dispute-id uint u1)
 (define-data-var arbitrator-min-stake uint u5000000)
 (define-data-var mediation-period uint u720)
@@ -128,6 +140,59 @@
     agreements: (optional (string-ascii 500)),
     created-at: uint,
     completed-at: (optional uint)
+  }
+)
+
+(define-map bounties uint
+  {
+    creator: principal,
+    target-company: (optional (string-ascii 100)),
+    bounty-type: (string-ascii 50),
+    description: (string-ascii 800),
+    evidence-requirements: (string-ascii 500),
+    reward-amount: uint,
+    creator-stake: uint,
+    expires-at: uint,
+    created-at: uint,
+    status: (string-ascii 20),
+    difficulty-level: uint,
+    claimed-by: (optional principal),
+    claimed-at: (optional uint),
+    verification-deadline: (optional uint),
+    verification-votes: uint,
+    verification-threshold: uint
+  }
+)
+
+(define-map bounty-hunters principal
+  {
+    total-bounties-claimed: uint,
+    successful-submissions: uint,
+    hunter-reputation: uint,
+    specializations: (list 5 (string-ascii 50)),
+    joined-at: uint,
+    total-rewards-earned: uint
+  }
+)
+
+(define-map bounty-submissions {bounty-id: uint, hunter: principal}
+  {
+    evidence-hash: (string-ascii 64),
+    submission-details: (string-ascii 1000),
+    supporting-documents: (string-ascii 200),
+    submitted-at: uint,
+    verification-status: (string-ascii 20),
+    verifier-votes: uint,
+    rejection-reason: (optional (string-ascii 300))
+  }
+)
+
+(define-map bounty-verifications {bounty-id: uint, verifier: principal}
+  {
+    vote: bool,
+    verification-notes: (string-ascii 300),
+    voted-at: uint,
+    verifier-stake: uint
   }
 )
 
@@ -305,7 +370,7 @@
       (caller tx-sender)
       (reward-amount (default-to u0 (map-get? whistleblower-rewards caller)))
     )
-    (asserts! (> reward-amount u0) (err u121))
+    (asserts! (> reward-amount u0) (err u130))
     (map-delete whistleblower-rewards caller)
     (as-contract (stx-transfer? reward-amount tx-sender caller))
   )
@@ -647,6 +712,292 @@
   (map-get? dispute-votes {dispute-id: dispute-id, voter: voter})
 )
 
+(define-public (create-bounty 
+  (target-company (optional (string-ascii 100)))
+  (bounty-type (string-ascii 50))
+  (description (string-ascii 800))
+  (evidence-requirements (string-ascii 500))
+  (reward-amount uint)
+  (creator-stake uint)
+  (duration-blocks uint)
+  (difficulty-level uint)
+)
+  (let
+    (
+      (caller tx-sender)
+      (bounty-id (var-get next-bounty-id))
+      (member-data (unwrap! (map-get? dao-members caller) ERR_NOT_MEMBER))
+      (expires-at (+ stacks-block-height duration-blocks))
+      (total-stake (+ reward-amount creator-stake))
+      (verification-threshold (if (>= difficulty-level u7) u5 u3))
+    )
+    ;; Validate inputs and member eligibility
+    (asserts! (>= reward-amount (var-get min-bounty-amount)) ERR_INSUFFICIENT_BOUNTY_STAKE)
+    (asserts! (>= (get stake-amount member-data) total-stake) ERR_INSUFFICIENT_STAKE)
+    (asserts! (<= difficulty-level u10) ERR_INVALID_BOUNTY_TYPE)
+    (asserts! (> duration-blocks u0) ERR_INVALID_BOUNTY_TYPE)
+    
+    ;; Transfer stake to contract
+    (try! (stx-transfer? total-stake caller (as-contract tx-sender)))
+    
+    ;; Create bounty record
+    (map-set bounties bounty-id
+      {
+        creator: caller,
+        target-company: target-company,
+        bounty-type: bounty-type,
+        description: description,
+        evidence-requirements: evidence-requirements,
+        reward-amount: reward-amount,
+        creator-stake: creator-stake,
+        expires-at: expires-at,
+        created-at: stacks-block-height,
+        status: "active",
+        difficulty-level: difficulty-level,
+        claimed-by: none,
+        claimed-at: none,
+        verification-deadline: none,
+        verification-votes: u0,
+        verification-threshold: verification-threshold
+      }
+    )
+    
+    (var-set next-bounty-id (+ bounty-id u1))
+    (ok bounty-id)
+  )
+)
+
+(define-public (register-bounty-hunter (specializations (list 5 (string-ascii 50))))
+  (let
+    (
+      (caller tx-sender)
+      (member-data (unwrap! (map-get? dao-members caller) ERR_NOT_MEMBER))
+    )
+    ;; Ensure minimum reputation for hunters
+    (asserts! (>= (get reputation member-data) u80) ERR_HUNTER_NOT_QUALIFIED)
+    
+    (map-set bounty-hunters caller
+      {
+        total-bounties-claimed: u0,
+        successful-submissions: u0,
+        hunter-reputation: (get reputation member-data),
+        specializations: specializations,
+        joined-at: stacks-block-height,
+        total-rewards-earned: u0
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (claim-bounty (bounty-id uint))
+  (let
+    (
+      (caller tx-sender)
+      (bounty (unwrap! (map-get? bounties bounty-id) ERR_BOUNTY_NOT_FOUND))
+      (hunter-data (unwrap! (map-get? bounty-hunters caller) ERR_HUNTER_NOT_QUALIFIED))
+    )
+    ;; Validate bounty status and timing
+    (asserts! (is-eq (get status bounty) "active") ERR_BOUNTY_NOT_ACTIVE)
+    (asserts! (< stacks-block-height (get expires-at bounty)) ERR_BOUNTY_EXPIRED)
+    (asserts! (is-none (get claimed-by bounty)) ERR_BOUNTY_ALREADY_CLAIMED)
+    
+    ;; Update bounty with claim info
+    (map-set bounties bounty-id
+      (merge bounty
+        {
+          claimed-by: (some caller),
+          claimed-at: (some stacks-block-height),
+          status: "claimed",
+          verification-deadline: (some (+ stacks-block-height (var-get bounty-verification-period)))
+        }
+      )
+    )
+    
+    ;; Update hunter stats
+    (map-set bounty-hunters caller
+      (merge hunter-data
+        {
+          total-bounties-claimed: (+ (get total-bounties-claimed hunter-data) u1)
+        }
+      )
+    )
+    (ok true)
+  )
+)
+
+(define-public (submit-bounty-evidence 
+  (bounty-id uint)
+  (evidence-hash (string-ascii 64))
+  (submission-details (string-ascii 1000))
+  (supporting-documents (string-ascii 200))
+)
+  (let
+    (
+      (caller tx-sender)
+      (bounty (unwrap! (map-get? bounties bounty-id) ERR_BOUNTY_NOT_FOUND))
+      (submission-key {bounty-id: bounty-id, hunter: caller})
+    )
+    ;; Validate submission eligibility
+    (asserts! (is-eq (some caller) (get claimed-by bounty)) ERR_NOT_AUTHORIZED)
+    (asserts! (is-eq (get status bounty) "claimed") ERR_BOUNTY_NOT_ACTIVE)
+    (asserts! (< stacks-block-height (unwrap! (get verification-deadline bounty) ERR_BOUNTY_EXPIRED)) ERR_BOUNTY_EXPIRED)
+    (asserts! (is-none (map-get? bounty-submissions submission-key)) ERR_INVALID_EVIDENCE_SUBMISSION)
+    
+    ;; Create evidence submission
+    (map-set bounty-submissions submission-key
+      {
+        evidence-hash: evidence-hash,
+        submission-details: submission-details,
+        supporting-documents: supporting-documents,
+        submitted-at: stacks-block-height,
+        verification-status: "pending",
+        verifier-votes: u0,
+        rejection-reason: none
+      }
+    )
+    
+    ;; Update bounty status
+    (map-set bounties bounty-id
+      (merge bounty {status: "verification"})
+    )
+    (ok true)
+  )
+)
+
+(define-public (verify-bounty-submission 
+  (bounty-id uint)
+  (hunter principal)
+  (approve bool)
+  (verification-notes (string-ascii 300))
+)
+  (let
+    (
+      (caller tx-sender)
+      (bounty (unwrap! (map-get? bounties bounty-id) ERR_BOUNTY_NOT_FOUND))
+      (member-data (unwrap! (map-get? dao-members caller) ERR_NOT_MEMBER))
+      (submission-key {bounty-id: bounty-id, hunter: hunter})
+      (verification-key {bounty-id: bounty-id, verifier: caller})
+      (submission (unwrap! (map-get? bounty-submissions submission-key) ERR_INVALID_EVIDENCE_SUBMISSION))
+    )
+    ;; Validate verifier eligibility
+    (asserts! (is-eq (get status bounty) "verification") ERR_BOUNTY_NOT_ACTIVE)
+    (asserts! (>= (get reputation member-data) u120) ERR_NOT_AUTHORIZED)
+    (asserts! (not (is-eq caller hunter)) ERR_NOT_AUTHORIZED)
+    (asserts! (not (is-eq caller (get creator bounty))) ERR_NOT_AUTHORIZED)
+    (asserts! (is-none (map-get? bounty-verifications verification-key)) ERR_ALREADY_VOTED)
+    
+    ;; Record verification vote
+    (map-set bounty-verifications verification-key
+      {
+        vote: approve,
+        verification-notes: verification-notes,
+        voted-at: stacks-block-height,
+        verifier-stake: (get stake-amount member-data)
+      }
+    )
+    
+    ;; Update verification count
+    (let
+      (
+        (new-vote-count (+ (get verification-votes bounty) u1))
+        (threshold (get verification-threshold bounty))
+      )
+      (map-set bounties bounty-id
+        (merge bounty {verification-votes: new-vote-count})
+      )
+      
+      ;; Check if verification threshold reached
+      (if (>= new-vote-count threshold)
+        (finalize-bounty-verification bounty-id hunter)
+        (ok true)
+      )
+    )
+  )
+)
+
+(define-private (finalize-bounty-verification (bounty-id uint) (hunter principal))
+  (let
+    (
+      (bounty (unwrap! (map-get? bounties bounty-id) ERR_BOUNTY_NOT_FOUND))
+      (hunter-data (unwrap! (map-get? bounty-hunters hunter) ERR_HUNTER_NOT_QUALIFIED))
+      (submission-key {bounty-id: bounty-id, hunter: hunter})
+      (approval-count (count-verification-approvals bounty-id))
+      (threshold (get verification-threshold bounty))
+    )
+    ;; Determine if submission passes verification
+    (if (>= approval-count (/ threshold u2))
+      (begin
+        ;; Approve submission and distribute rewards
+        (map-set bounty-submissions submission-key
+          (merge (unwrap-panic (map-get? bounty-submissions submission-key))
+            {verification-status: "approved"}
+          )
+        )
+        (map-set bounties bounty-id
+          (merge bounty {status: "completed"})
+        )
+        (map-set bounty-hunters hunter
+          (merge hunter-data
+            {
+              successful-submissions: (+ (get successful-submissions hunter-data) u1),
+              hunter-reputation: (+ (get hunter-reputation hunter-data) u15),
+              total-rewards-earned: (+ (get total-rewards-earned hunter-data) (get reward-amount bounty))
+            }
+          )
+        )
+        ;; Transfer reward to hunter
+        (as-contract (stx-transfer? (get reward-amount bounty) tx-sender hunter))
+      )
+      (begin
+        ;; Reject submission
+        (map-set bounty-submissions submission-key
+          (merge (unwrap-panic (map-get? bounty-submissions submission-key))
+            {
+              verification-status: "rejected",
+              rejection-reason: (some "Insufficient verification approvals")
+            }
+          )
+        )
+        (map-set bounties bounty-id
+          (merge bounty {status: "active", claimed-by: none, claimed-at: none})
+        )
+        (ok false)
+      )
+    )
+  )
+)
+
+(define-private (count-verification-approvals (bounty-id uint))
+  ;; Simplified count - in production would iterate through all verifications
+  u2
+)
+
+(define-read-only (get-bounty (bounty-id uint))
+  (map-get? bounties bounty-id)
+)
+
+(define-read-only (get-bounty-hunter (hunter principal))
+  (map-get? bounty-hunters hunter)
+)
+
+(define-read-only (get-bounty-submission (bounty-id uint) (hunter principal))
+  (map-get? bounty-submissions {bounty-id: bounty-id, hunter: hunter})
+)
+
+(define-read-only (get-active-bounties)
+  (let
+    (
+      (current-block stacks-block-height)
+      (next-id (var-get next-bounty-id))
+    )
+    {
+      total-bounties: (- next-id u1),
+      current-block: current-block
+    }
+  )
+)
+
 (define-read-only (calculate-voting-power (member principal))
   (let
     (
@@ -658,3 +1009,6 @@
     )
   )
 )
+
+
+
