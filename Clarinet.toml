@@ -9,6 +9,10 @@ requirements = []
 path = 'contracts/Datadao.clar'
 clarity_version = 3
 epoch = 3.1
+[contracts.anonymous-tips]
+path = 'contracts/anonymous-tips.clar'
+clarity_version = 3
+epoch = 3.1
 [repl.analysis]
 passes = ['check_checker']
 
